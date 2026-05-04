@@ -16,6 +16,7 @@ use crate::model::{
     identity_maps::{IdentityHashBuilder, IdentityHashMap, IdentityHashSet},
     ids::{ConstantReferenceId, DeclarationId, DefinitionId, InstanceVariableReferenceId, NameId, StringId},
     name::{Name, NameRef, ParentScope},
+    references::InstanceVariableReference,
 };
 
 enum Outcome {
@@ -720,8 +721,12 @@ impl<'a> Resolver<'a> {
     /// Resolves all instance variable references by linking them to their target declarations.
     /// Runs as a post-pass after `handle_remaining_definitions` since ivar declarations must exist first.
     fn resolve_instance_variable_references(&mut self) {
-        let ivar_ref_ids: Vec<InstanceVariableReferenceId> =
-            self.graph.instance_variable_references().keys().copied().collect();
+        let ivar_ref_ids: Vec<InstanceVariableReferenceId> = self
+            .graph
+            .instance_variable_references()
+            .iter()
+            .filter_map(|(id, ivar_ref)| matches!(ivar_ref, InstanceVariableReference::Unresolved(_)).then_some(*id))
+            .collect();
 
         for ref_id in ivar_ref_ids {
             let ivar_ref = self.graph.instance_variable_references().get(&ref_id).unwrap();
@@ -761,12 +766,8 @@ impl<'a> Resolver<'a> {
         None
     }
 
-    /// Resolve an instance variable owner, creating missing singleton classes and re-queueing
-    /// the definition when its receiver or surrounding namespace is temporarily unresolved.
-    ///
-    /// Re-queueing is essential during incremental delete-then-readd of a receiver: without it,
-    /// ivars whose owner depends on a freshly-deleted receiver would be permanently dropped or
-    /// attached to `Object` (regression of #775).
+    /// Resolve an instance variable owner, creating missing singleton classes and re-queueing the definition when its
+    /// receiver or surrounding namespace is temporarily unresolved.
     fn resolve_ivar_owner(
         &mut self,
         lexical_nesting_id: Option<DefinitionId>,
@@ -787,11 +788,12 @@ impl<'a> Resolver<'a> {
                             self.resolve_constant_receiver(*name_id, definition_id)?
                         }
                     };
+
                     self.get_or_create_singleton_class(receiver_decl_id, true)
                 } else {
-                    // Owner is the method's lexical owner directly. If the method lives inside a
-                    // singleton class body, that owner is the singleton class itself (so `@bar`
-                    // belongs to `Foo::<Foo>`); otherwise it's the surrounding regular namespace.
+                    // Owner is the method's lexical owner directly. If the method lives inside a singleton class body,
+                    // that owner is the singleton class itself (so `@bar` belongs to `Foo::<Foo>`); otherwise it's the
+                    // surrounding regular namespace.
                     let method_lexical = *method.lexical_nesting_id();
                     self.resolve_lexical_owner(method_lexical, definition_id)
                 }
@@ -802,16 +804,17 @@ impl<'a> Resolver<'a> {
                     .definition_id_to_declaration_id(nesting_id)
                     .copied()
                     .unwrap_or(*OBJECT_ID);
+
                 self.get_or_create_singleton_class(nesting_decl_id, true)
             }
             Definition::SingletonClass(_) => {
-                // The singleton's declaration may be missing (e.g. its receiver was just
-                // deleted). Re-queue and let the next resolve place `@bar` on the right
-                // owner instead of falling back to Object.
+                // The singleton's declaration may be missing (e.g. its receiver was just deleted). Re-queue and let the
+                // next resolve place `@bar` on the right owner instead of falling back to Object.
                 let Some(&singleton_class_decl_id) = self.graph.definition_id_to_declaration_id(nesting_id) else {
                     self.graph.push_work(Unit::Definition(definition_id));
                     return None;
                 };
+
                 Some(
                     self.get_or_create_singleton_class(singleton_class_decl_id, true)
                         .expect("singleton class nesting should always be a namespace"),
@@ -821,9 +824,9 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    /// Read-only sibling of [`Self::resolve_ivar_owner`] used during the post-pass that resolves
-    /// instance variable references. Cannot create singleton classes or re-queue work — returns
-    /// `None` whenever the corresponding definition path would have done either.
+    /// Read-only sibling of [`Self::resolve_ivar_owner`] used during the post-pass that resolves instance variable
+    /// references. Cannot create singleton classes or re-queue work — returns `None` whenever the corresponding
+    /// definition path would have done either.
     fn find_ivar_owner(&self, lexical_nesting_id: Option<DefinitionId>) -> Option<DeclarationId> {
         let nesting_id = lexical_nesting_id?;
         let nesting_def = self.graph.definitions().get(&nesting_id)?;

@@ -3,8 +3,9 @@ use crate::{
     assert_alias_targets_contain, assert_ancestors_eq, assert_constant_alias_target_eq, assert_constant_reference_to,
     assert_constant_reference_unresolved, assert_declaration_definitions_count_eq, assert_declaration_does_not_exist,
     assert_declaration_exists, assert_declaration_kind_eq, assert_declaration_references_count_eq, assert_descendants,
-    assert_diagnostics_eq, assert_instance_variables_eq, assert_members_eq, assert_no_constant_alias_target,
-    assert_no_diagnostics, assert_no_members, assert_owner_eq, assert_singleton_class_eq,
+    assert_diagnostics_eq, assert_instance_variables_eq, assert_ivar_reference_unresolved, assert_members_eq,
+    assert_no_constant_alias_target, assert_no_diagnostics, assert_no_members, assert_owner_eq,
+    assert_singleton_class_eq,
     diagnostic::Rule,
     model::{declaration::Ancestors, ids::DeclarationId, name::NameRef},
     test_utils::GraphTest,
@@ -3865,6 +3866,54 @@ fn ivar_reference_inside_method_with_receiver() {
 
     assert_no_diagnostics!(&context);
     assert_declaration_references_count_eq!(context, "Foo::<Foo>#@var", 1);
+}
+
+#[test]
+fn ivar_reference_in_singleton_class_body() {
+    let mut context = GraphTest::new();
+    context.index_uri(
+        "file:///foo.rb",
+        r"
+        class Foo
+          class << self
+            @bar = 1
+            @bar
+
+            def self.bar
+              @bar
+            end
+          end
+        end
+        ",
+    );
+    context.resolve();
+
+    assert_no_diagnostics!(&context, &[Rule::ParseWarning]);
+    assert_declaration_references_count_eq!(context, "Foo::<Foo>::<<Foo>>#@bar", 2);
+}
+
+#[test]
+fn ivar_reference_unresolved_when_not_defined_in_ancestor() {
+    let mut context = GraphTest::new();
+    context.index_uri(
+        "file:///foo.rb",
+        r"
+        class Foo
+        end
+
+        class Bar < Foo
+          def bar
+            @bar
+          end
+        end
+        ",
+    );
+    context.resolve();
+
+    assert_no_diagnostics!(&context);
+    assert_declaration_does_not_exist!(context, "Foo#@bar");
+    assert_declaration_does_not_exist!(context, "Bar#@bar");
+    assert_ivar_reference_unresolved!(context, "@bar");
 }
 
 mod todo_tests {

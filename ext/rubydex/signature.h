@@ -18,4 +18,6 @@ extern VALUE cBlockParameter;
 
 void rdxi_initialize_signature(VALUE mRubydex);
 
+VALUE rdxi_signatures_to_ruby(SignatureArray *arr);
+
 #endif // RUBYDEX_SIGNATURE_H

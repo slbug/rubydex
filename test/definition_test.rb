@@ -668,6 +668,53 @@ class DefinitionTest < Minitest::Test
     end
   end
 
+  def test_definition_declaration
+    with_context do |context|
+      context.write!("file1.rb", <<~RUBY)
+        class Foo
+          def bar; end
+        end
+
+        module M; end
+        FOO = 1
+      RUBY
+
+      graph = Rubydex::Graph.new
+      graph.index_all(context.glob("**/*.rb"))
+
+      defs = graph.documents.find { |d| d.uri == context.uri_to("file1.rb") }.definitions
+
+      class_def = defs.find { |d| d.name == "Foo" }
+      method_def = defs.find { |d| d.name == "bar()" }
+      module_def = defs.find { |d| d.name == "M" }
+      const_def = defs.find { |d| d.name == "FOO" }
+
+      # Before resolution, declarations do not exist yet
+      assert_nil(class_def.declaration)
+      assert_nil(method_def.declaration)
+      assert_nil(module_def.declaration)
+      assert_nil(const_def.declaration)
+
+      graph.resolve
+
+      class_decl = class_def.declaration
+      assert_instance_of(Rubydex::Class, class_decl)
+      assert_equal("Foo", class_decl.name)
+
+      method_decl = method_def.declaration
+      assert_instance_of(Rubydex::Method, method_decl)
+      assert_equal("Foo#bar()", method_decl.name)
+
+      module_decl = module_def.declaration
+      assert_instance_of(Rubydex::Module, module_decl)
+      assert_equal("M", module_decl.name)
+
+      const_decl = const_def.declaration
+      assert_instance_of(Rubydex::Constant, const_decl)
+      assert_equal("FOO", const_decl.name)
+    end
+  end
+
   private
 
   # Comment locations on Windows include the carriage return. This means that the end column is off by one when compared

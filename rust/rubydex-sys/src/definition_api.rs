@@ -1,5 +1,6 @@
 //! This file provides the C API for Definition accessors
 
+use crate::declaration_api::CDeclaration;
 use crate::graph_api::{GraphPointer, with_graph};
 use crate::location_api::{Location, create_location_for_uri_and_offset};
 use crate::reference_api::CConstantReference;
@@ -247,6 +248,31 @@ pub unsafe extern "C" fn rdx_definition_location(pointer: GraphPointer, definiti
 
         let document = graph.documents().get(defn.uri_id()).expect("document should exist");
         create_location_for_uri_and_offset(graph, document, defn.offset())
+    })
+}
+
+/// Returns the declaration that the given definition belongs to. Returns NULL when the definition has no associated
+/// declaration (for example, before resolution has run or when the declaration cannot be located). Caller must free
+/// with `free_c_declaration`.
+///
+/// # Safety
+/// - `pointer` must be a valid pointer previously returned by `rdx_graph_new`.
+/// - `definition_id` must be a valid definition id.
+///
+/// # Panics
+/// This function will panic if the definition cannot be found.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rdx_definition_declaration(pointer: GraphPointer, definition_id: u64) -> *const CDeclaration {
+    with_graph(pointer, |graph| {
+        let def_id = DefinitionId::new(definition_id);
+        let Some(decl_id) = graph.definition_id_to_declaration_id(def_id) else {
+            return ptr::null();
+        };
+        let Some(decl) = graph.declarations().get(decl_id) else {
+            return ptr::null();
+        };
+
+        Box::into_raw(Box::new(CDeclaration::from_declaration(*decl_id, decl))).cast_const()
     })
 }
 

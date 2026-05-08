@@ -44,7 +44,12 @@ impl<'a> DotBuilder<'a> {
         self.output.push('\n');
     }
 
+    fn html_escape(s: &str) -> String {
+        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    }
+
     fn label(type_name: &str, name: &str, color: &str) -> String {
+        let escaped = Self::html_escape(name);
         format!(
             concat!(
                 "<<table border=\"0\" cellborder=\"0\" cellspacing=\"0\" align=\"center\">",
@@ -52,7 +57,7 @@ impl<'a> DotBuilder<'a> {
                 "<tr><td align=\"center\"><b>{}</b></td></tr>",
                 "</table>>",
             ),
-            color, type_name, name,
+            color, type_name, escaped,
         )
     }
 

@@ -502,3 +502,13 @@ pub fn apply_operations(result: OperationBuilderResult) -> LocalGraph {
 
     applier.local_graph
 }
+
+#[cfg(test)]
+fn backend() -> crate::indexing::IndexerBackend {
+    crate::indexing::IndexerBackend::OperationBuilder
+}
+
+#[cfg(test)]
+#[allow(clippy::duplicate_mod)]
+#[path = "../indexing/ruby_indexer_tests.rs"]
+mod applier_tests;

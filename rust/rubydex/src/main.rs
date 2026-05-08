@@ -9,7 +9,7 @@ use rubydex::{
         memory::MemoryStats,
         timer::{Timer, time_it},
     },
-    visualization::dot,
+    dot,
 };
 
 #[derive(Parser, Debug)]

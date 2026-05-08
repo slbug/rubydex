@@ -512,3 +512,8 @@ fn backend() -> crate::indexing::IndexerBackend {
 #[allow(clippy::duplicate_mod)]
 #[path = "../indexing/ruby_indexer_tests.rs"]
 mod applier_tests;
+
+#[cfg(test)]
+#[allow(clippy::duplicate_mod)]
+#[path = "../resolution_tests.rs"]
+mod resolution_tests;

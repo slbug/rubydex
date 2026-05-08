@@ -25,8 +25,20 @@ struct Args {
     #[arg(long = "dot", help = "Output a DOT graph visualization")]
     dot: bool,
 
-    #[arg(long = "show-builtins", help = "Include built-in declarations in DOT output")]
-    show_builtins: bool,
+    #[arg(long = "dot-show-builtins", default_value = "false", num_args = 1, value_parser = clap::builder::BoolishValueParser::new(), help = "Include built-in declarations in DOT output")]
+    dot_show_builtins: bool,
+
+    #[arg(long = "dot-show-documents", default_value = "true", num_args = 1, value_parser = clap::builder::BoolishValueParser::new(), help = "Show document nodes in DOT output")]
+    dot_show_documents: bool,
+
+    #[arg(long = "dot-show-definitions", value_delimiter = ',', help = "Filter DOT definitions by kind (e.g. Class,Module,Method)")]
+    dot_show_definitions: Option<Vec<String>>,
+
+    #[arg(long = "dot-show-declarations", value_delimiter = ',', help = "Filter DOT declarations by kind (e.g. Class,Module,Method)")]
+    dot_show_declarations: Option<Vec<String>>,
+
+    #[arg(long = "dot-show-edges", value_delimiter = ',', help = "Filter DOT edges by type (e.g. defines,declares,contains,inherits,includes,prepends,extends,owns)")]
+    dot_show_edges: Option<Vec<String>>,
 
     #[arg(long = "stats", help = "Show detailed performance statistics")]
     stats: bool,
@@ -63,6 +75,17 @@ fn exit(print_stats: bool) {
 
 fn main() {
     let args = Args::parse();
+
+    if !args.dot
+        && (args.dot_show_builtins
+            || !args.dot_show_documents
+            || args.dot_show_definitions.is_some()
+            || args.dot_show_declarations.is_some()
+            || args.dot_show_edges.is_some())
+    {
+        eprintln!("Error: --dot-* options require --dot");
+        std::process::exit(1);
+    }
 
     if args.stats {
         Timer::set_global_timer(Timer::new());
@@ -150,7 +173,14 @@ fn main() {
 
     // Generate visualization or print statistics
     if args.dot {
-        println!("{}", dot::DotBuilder::generate(&graph, args.show_builtins));
+        println!("{}", dot::DotBuilder::generate(
+            &graph,
+            args.dot_show_builtins,
+            args.dot_show_documents,
+            args.dot_show_declarations.as_deref(),
+            args.dot_show_definitions.as_deref(),
+            args.dot_show_edges.as_deref(),
+        ));
     } else {
         println!("Indexed {} files", graph.documents().len());
         println!("Found {} names", graph.declarations().len());

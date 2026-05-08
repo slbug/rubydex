@@ -142,6 +142,9 @@ class Rubydex::Definition
   sig { returns(T.nilable(Rubydex::Location)) }
   def name_location; end
 
+  sig { returns(T.nilable(Rubydex::Declaration)) }
+  def declaration; end
+
   class << self
     private
 

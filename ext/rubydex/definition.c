@@ -1,4 +1,5 @@
 #include "definition.h"
+#include "declaration.h"
 #include "graph.h"
 #include "handle.h"
 #include "location.h"
@@ -172,6 +173,28 @@ static VALUE rdxr_definition_name_location(VALUE self) {
     return location;
 }
 
+// Definition#declaration -> Rubydex::Declaration?
+// Returns the declaration this definition belongs to or nil when it cannot be located (for example, before
+// `Graph#resolve` has run).
+static VALUE rdxr_definition_declaration(VALUE self) {
+    HandleData *data;
+    TypedData_Get_Struct(self, HandleData, &handle_type, data);
+
+    void *graph;
+    TypedData_Get_Struct(data->graph_obj, void *, &graph_type, graph);
+
+    const struct CDeclaration *decl = rdx_definition_declaration(graph, data->id);
+    if (decl == NULL) {
+        return Qnil;
+    }
+
+    VALUE decl_class = rdxi_declaration_class_for_kind(decl->kind);
+    VALUE argv[] = {data->graph_obj, ULL2NUM(decl->id)};
+    free_c_declaration(decl);
+
+    return rb_class_new_instance(2, argv, decl_class);
+}
+
 static VALUE rdxi_build_constant_reference(VALUE graph_obj, const CConstantReference *cref) {
     VALUE ref_class = (cref->declaration_id == 0)
         ? cUnresolvedConstantReference
@@ -282,6 +305,7 @@ void rdxi_initialize_definition(VALUE mod) {
     rb_define_method(cDefinition, "name", rdxr_definition_name, 0);
     rb_define_method(cDefinition, "deprecated?", rdxr_definition_deprecated, 0);
     rb_define_method(cDefinition, "name_location", rdxr_definition_name_location, 0);
+    rb_define_method(cDefinition, "declaration", rdxr_definition_declaration, 0);
 
     cClassDefinition = rb_define_class_under(mRubydex, "ClassDefinition", cDefinition);
     rb_define_method(cClassDefinition, "superclass", rdxr_class_definition_superclass, 0);

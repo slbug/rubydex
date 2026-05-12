@@ -1,12 +1,46 @@
-use std::hash::Hash;
+use std::{
+    collections::hash_map::Entry,
+    hash::{Hash, Hasher},
+};
 
+#[cfg(test)]
+use crate::model::definitions::Definition;
 use crate::model::identity_maps::IdentityHashMap;
-use crate::model::ids::{DeclarationId, DefinitionId};
+use crate::model::ids::{DeclarationId, DefinitionId, StringId};
+
+fn push_unique<T: Copy + Eq>(values: &mut Vec<T>, value: T) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MethodVisibilityDependencyKey {
+    owner_id: DeclarationId,
+    str_id: StringId,
+}
+
+impl MethodVisibilityDependencyKey {
+    fn new(owner_id: DeclarationId, str_id: StringId) -> Self {
+        Self { owner_id, str_id }
+    }
+}
+
+impl Hash for MethodVisibilityDependencyKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let owner = self.owner_id.get();
+        let name = self.str_id.get();
+        state.write_u64(owner.rotate_left(17) ^ name.rotate_right(11));
+    }
+}
 
 /// Small bidirectional multi-map for feature-local reverse indexes.
 ///
 /// Values are stored in `Vec`s because the expected fanout is tiny: a method visibility usually depends on one alias,
 /// one owner, or one source method. If these relationships become high-cardinality, switch the lists to sets.
+///
+/// This uses `IdentityHashMap`, so keys and values must hash through a single `write_u64`/`write_u32` path. The current
+/// users are graph IDs and `MethodVisibilityDependencyKey`, which implements that explicitly.
 #[derive(Debug)]
 struct BiMultiMap<K, V> {
     forward: IdentityHashMap<K, Vec<V>>,
@@ -28,15 +62,8 @@ where
     V: Copy + Eq + Hash,
 {
     fn insert(&mut self, key: K, value: V) {
-        let values = self.forward.entry(key).or_default();
-        if !values.contains(&value) {
-            values.push(value);
-        }
-
-        let keys = self.reverse.entry(value).or_default();
-        if !keys.contains(&key) {
-            keys.push(key);
-        }
+        push_unique(self.forward.entry(key).or_default(), value);
+        push_unique(self.reverse.entry(value).or_default(), key);
     }
 
     fn remove_key(&mut self, key: K) -> Vec<V> {
@@ -69,6 +96,10 @@ where
         keys
     }
 
+    fn is_empty(&self) -> bool {
+        self.forward.is_empty()
+    }
+
     fn debug_assert_consistent(&self) {
         #[cfg(debug_assertions)]
         {
@@ -90,6 +121,11 @@ where
                 }
             }
         }
+    }
+
+    #[cfg(test)]
+    fn values(&self) -> impl Iterator<Item = V> + '_ {
+        self.reverse.keys().copied()
     }
 }
 
@@ -134,20 +170,19 @@ impl GeneratedMethodCopies {
         trigger_definition_id: DefinitionId,
         declaration_id: DeclarationId,
     ) {
-        let existing = self.definitions.insert(
-            generated_definition_id,
-            GeneratedMethodCopy {
-                source_definition_id,
-                trigger_definition_ids: Vec::new(),
-                declaration_id,
-            },
-        );
-        debug_assert!(existing.is_none(), "generated definition inserted twice");
+        match self.definitions.entry(generated_definition_id) {
+            Entry::Occupied(_) => panic!("generated definition inserted twice"),
+            Entry::Vacant(entry) => {
+                entry.insert(GeneratedMethodCopy {
+                    source_definition_id,
+                    trigger_definition_ids: Vec::new(),
+                    declaration_id,
+                });
+            }
+        }
 
         let generated_ids = self.by_source.entry(source_definition_id).or_default();
-        if !generated_ids.contains(&generated_definition_id) {
-            generated_ids.push(generated_definition_id);
-        }
+        push_unique(generated_ids, generated_definition_id);
 
         self.attach_trigger(generated_definition_id, trigger_definition_id);
     }
@@ -158,18 +193,18 @@ impl GeneratedMethodCopies {
             .get_mut(&generated_definition_id)
             .expect("generated definition should exist before attaching trigger");
 
-        if !definition.trigger_definition_ids.contains(&trigger_definition_id) {
-            definition.trigger_definition_ids.push(trigger_definition_id);
-        }
+        push_unique(&mut definition.trigger_definition_ids, trigger_definition_id);
 
         let generated_ids = self.by_trigger.entry(trigger_definition_id).or_default();
-        if !generated_ids.contains(&generated_definition_id) {
-            generated_ids.push(generated_definition_id);
-        }
+        push_unique(generated_ids, generated_definition_id);
     }
 
     fn ids_for_source(&self, source_definition_id: DefinitionId) -> Vec<DefinitionId> {
         self.by_source.get(&source_definition_id).cloned().unwrap_or_default()
+    }
+
+    fn ids_for_trigger(&self, trigger_definition_id: DefinitionId) -> Vec<DefinitionId> {
+        self.by_trigger.get(&trigger_definition_id).cloned().unwrap_or_default()
     }
 
     fn detach_trigger(&mut self, trigger_definition_id: DefinitionId) -> Vec<DefinitionId> {
@@ -281,6 +316,7 @@ pub(crate) struct ModuleFunctionCopies {
     generated: GeneratedMethodCopies,
     alias_dependent_visibilities: BiMultiMap<DefinitionId, DefinitionId>,
     ancestor_dependent_visibilities: BiMultiMap<DeclarationId, DefinitionId>,
+    ancestor_dependent_visibilities_by_member: BiMultiMap<MethodVisibilityDependencyKey, DefinitionId>,
     document_owned_visibilities: BiMultiMap<DefinitionId, DefinitionId>,
 }
 
@@ -348,10 +384,15 @@ impl ModuleFunctionCopies {
     pub(crate) fn track_ancestor_dependent_visibility(
         &mut self,
         owner_id: DeclarationId,
+        str_id: StringId,
         visibility_definition_id: DefinitionId,
     ) {
         self.ancestor_dependent_visibilities
             .insert(owner_id, visibility_definition_id);
+        self.ancestor_dependent_visibilities_by_member.insert(
+            MethodVisibilityDependencyKey::new(owner_id, str_id),
+            visibility_definition_id,
+        );
         self.debug_assert_consistent();
     }
 
@@ -360,12 +401,33 @@ impl ModuleFunctionCopies {
         owner_id: DeclarationId,
     ) -> Vec<DefinitionId> {
         let visibility_ids = self.ancestor_dependent_visibilities.remove_key(owner_id);
+        for visibility_id in &visibility_ids {
+            self.ancestor_dependent_visibilities_by_member
+                .remove_value(*visibility_id);
+        }
+        self.debug_assert_consistent();
+        visibility_ids
+    }
+
+    pub(crate) fn take_ancestor_dependent_visibility_ids_for_owner_and_member(
+        &mut self,
+        owner_id: DeclarationId,
+        str_id: StringId,
+    ) -> Vec<DefinitionId> {
+        let visibility_ids = self
+            .ancestor_dependent_visibilities_by_member
+            .remove_key(MethodVisibilityDependencyKey::new(owner_id, str_id));
+        for visibility_id in &visibility_ids {
+            self.ancestor_dependent_visibilities.remove_value(*visibility_id);
+        }
         self.debug_assert_consistent();
         visibility_ids
     }
 
     pub(crate) fn detach_ancestor_dependent_visibility(&mut self, visibility_definition_id: DefinitionId) {
         self.ancestor_dependent_visibilities
+            .remove_value(visibility_definition_id);
+        self.ancestor_dependent_visibilities_by_member
             .remove_value(visibility_definition_id);
         self.debug_assert_consistent();
     }
@@ -382,6 +444,10 @@ impl ModuleFunctionCopies {
 
     pub(crate) fn copy_ids_for_source(&self, source_definition_id: DefinitionId) -> Vec<DefinitionId> {
         self.generated.ids_for_source(source_definition_id)
+    }
+
+    pub(crate) fn copy_ids_for_visibility(&self, visibility_definition_id: DefinitionId) -> Vec<DefinitionId> {
+        self.generated.ids_for_trigger(visibility_definition_id)
     }
 
     pub(crate) fn take_document_owned_visibility_ids_for_source(
@@ -410,11 +476,62 @@ impl ModuleFunctionCopies {
         definition
     }
 
+    pub(crate) fn has_ancestor_dependent_visibilities(&self) -> bool {
+        !self.ancestor_dependent_visibilities.is_empty()
+    }
+
     fn debug_assert_consistent(&self) {
         self.generated.debug_assert_consistent();
         self.alias_dependent_visibilities.debug_assert_consistent();
         self.ancestor_dependent_visibilities.debug_assert_consistent();
+        self.ancestor_dependent_visibilities_by_member.debug_assert_consistent();
         self.document_owned_visibilities.debug_assert_consistent();
+    }
+}
+
+#[derive(Default, Debug)]
+pub(crate) struct AppliedMethodVisibilities {
+    by_owner_and_member: BiMultiMap<MethodVisibilityDependencyKey, DefinitionId>,
+}
+
+impl AppliedMethodVisibilities {
+    pub(crate) fn track(&mut self, owner_id: DeclarationId, str_id: StringId, visibility_definition_id: DefinitionId) {
+        self.by_owner_and_member.insert(
+            MethodVisibilityDependencyKey::new(owner_id, str_id),
+            visibility_definition_id,
+        );
+        self.debug_assert_consistent();
+    }
+
+    pub(crate) fn take_for_owner_and_member(&mut self, owner_id: DeclarationId, str_id: StringId) -> Vec<DefinitionId> {
+        let visibility_ids = self
+            .by_owner_and_member
+            .remove_key(MethodVisibilityDependencyKey::new(owner_id, str_id));
+        self.debug_assert_consistent();
+        visibility_ids
+    }
+
+    pub(crate) fn detach(&mut self, visibility_definition_id: DefinitionId) {
+        self.by_owner_and_member.remove_value(visibility_definition_id);
+        self.debug_assert_consistent();
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_owner_and_member.is_empty()
+    }
+
+    fn debug_assert_consistent(&self) {
+        self.by_owner_and_member.debug_assert_consistent();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_visibility_definitions_exist(&self, definitions: &IdentityHashMap<DefinitionId, Definition>) {
+        for visibility_id in self.by_owner_and_member.values() {
+            assert!(
+                matches!(definitions.get(&visibility_id), Some(Definition::MethodVisibility(_))),
+                "applied method visibility index references a missing or non-visibility definition"
+            );
+        }
     }
 }
 
@@ -425,33 +542,154 @@ impl ModuleFunctionCopies {
 #[derive(Default, Debug)]
 pub(crate) struct UnresolvedMethodVisibilities {
     by_owner: IdentityHashMap<DeclarationId, Vec<DefinitionId>>,
-    owner_by_visibility: IdentityHashMap<DefinitionId, DeclarationId>,
+    by_owner_and_member: IdentityHashMap<MethodVisibilityDependencyKey, Vec<DefinitionId>>,
+    owner_by_visibility: IdentityHashMap<DefinitionId, MethodVisibilityDependencyKey>,
 }
 
 impl UnresolvedMethodVisibilities {
-    pub(crate) fn track(&mut self, owner_id: DeclarationId, visibility_definition_id: DefinitionId) {
-        self.owner_by_visibility.insert(visibility_definition_id, owner_id);
+    pub(crate) fn track(
+        &mut self,
+        owner_id: DeclarationId,
+        str_id: StringId,
+        visibility_definition_id: DefinitionId,
+    ) -> Option<DeclarationId> {
+        let key = MethodVisibilityDependencyKey::new(owner_id, str_id);
+        let old_key = self
+            .owner_by_visibility
+            .insert(visibility_definition_id, key)
+            .filter(|old_key| *old_key != key);
+
+        if let Some(old_key) = old_key {
+            Self::remove_from_owner_map(&mut self.by_owner, old_key.owner_id, visibility_definition_id);
+            Self::remove_from_owner_and_member_map(&mut self.by_owner_and_member, old_key, visibility_definition_id);
+        }
 
         let visibility_ids = self.by_owner.entry(owner_id).or_default();
-        if !visibility_ids.contains(&visibility_definition_id) {
-            visibility_ids.push(visibility_definition_id);
-        }
+        push_unique(visibility_ids, visibility_definition_id);
+
+        let visibility_ids = self.by_owner_and_member.entry(key).or_default();
+        push_unique(visibility_ids, visibility_definition_id);
+
+        self.debug_assert_consistent();
+        old_key.map(|key| key.owner_id)
     }
 
     pub(crate) fn remove(&mut self, visibility_definition_id: DefinitionId) -> Option<DeclarationId> {
-        let owner_id = self.owner_by_visibility.remove(&visibility_definition_id)?;
+        let key = self.owner_by_visibility.remove(&visibility_definition_id)?;
 
-        if let Some(visibility_ids) = self.by_owner.get_mut(&owner_id) {
-            visibility_ids.retain(|id| *id != visibility_definition_id);
-            if visibility_ids.is_empty() {
-                self.by_owner.remove(&owner_id);
+        Self::remove_from_owner_map(&mut self.by_owner, key.owner_id, visibility_definition_id);
+        Self::remove_from_owner_and_member_map(&mut self.by_owner_and_member, key, visibility_definition_id);
+
+        self.debug_assert_consistent();
+        Some(key.owner_id)
+    }
+
+    pub(crate) fn take_for_owner(&mut self, owner_id: DeclarationId) -> Vec<DefinitionId> {
+        let visibility_ids = self.by_owner.remove(&owner_id).unwrap_or_default();
+
+        for visibility_id in &visibility_ids {
+            if let Some(key) = self.owner_by_visibility.remove(visibility_id) {
+                Self::remove_from_owner_and_member_map(&mut self.by_owner_and_member, key, *visibility_id);
             }
         }
 
-        Some(owner_id)
+        self.debug_assert_consistent();
+        visibility_ids
     }
 
-    pub(crate) fn visibility_ids_for_owner(&self, owner_id: DeclarationId) -> Vec<DefinitionId> {
-        self.by_owner.get(&owner_id).cloned().unwrap_or_default()
+    pub(crate) fn take_for_owner_and_member(&mut self, owner_id: DeclarationId, str_id: StringId) -> Vec<DefinitionId> {
+        let key = MethodVisibilityDependencyKey::new(owner_id, str_id);
+        let visibility_ids = self.by_owner_and_member.remove(&key).unwrap_or_default();
+
+        for visibility_id in &visibility_ids {
+            if self.owner_by_visibility.remove(visibility_id).is_some() {
+                Self::remove_from_owner_map(&mut self.by_owner, owner_id, *visibility_id);
+            }
+        }
+
+        self.debug_assert_consistent();
+        visibility_ids
+    }
+
+    fn remove_from_owner_map(
+        by_owner: &mut IdentityHashMap<DeclarationId, Vec<DefinitionId>>,
+        owner_id: DeclarationId,
+        visibility_definition_id: DefinitionId,
+    ) {
+        if let Some(visibility_ids) = by_owner.get_mut(&owner_id) {
+            visibility_ids.retain(|id| *id != visibility_definition_id);
+            if visibility_ids.is_empty() {
+                by_owner.remove(&owner_id);
+            }
+        }
+    }
+
+    fn remove_from_owner_and_member_map(
+        by_owner_and_member: &mut IdentityHashMap<MethodVisibilityDependencyKey, Vec<DefinitionId>>,
+        key: MethodVisibilityDependencyKey,
+        visibility_definition_id: DefinitionId,
+    ) {
+        if let Some(visibility_ids) = by_owner_and_member.get_mut(&key) {
+            visibility_ids.retain(|id| *id != visibility_definition_id);
+            if visibility_ids.is_empty() {
+                by_owner_and_member.remove(&key);
+            }
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_owner.is_empty()
+    }
+
+    fn debug_assert_consistent(&self) {
+        #[cfg(debug_assertions)]
+        {
+            for (owner_id, visibility_ids) in &self.by_owner {
+                for visibility_id in visibility_ids {
+                    debug_assert!(
+                        self.owner_by_visibility
+                            .get(visibility_id)
+                            .is_some_and(|key| key.owner_id == *owner_id),
+                        "unresolved visibility missing owner reverse edge"
+                    );
+                }
+            }
+
+            for (key, visibility_ids) in &self.by_owner_and_member {
+                for visibility_id in visibility_ids {
+                    debug_assert!(
+                        self.owner_by_visibility
+                            .get(visibility_id)
+                            .is_some_and(|stored_key| stored_key == key),
+                        "unresolved visibility missing owner/member reverse edge"
+                    );
+                }
+            }
+
+            for (visibility_id, key) in &self.owner_by_visibility {
+                debug_assert!(
+                    self.by_owner
+                        .get(&key.owner_id)
+                        .is_some_and(|visibility_ids| visibility_ids.contains(visibility_id)),
+                    "unresolved visibility missing owner forward edge"
+                );
+                debug_assert!(
+                    self.by_owner_and_member
+                        .get(key)
+                        .is_some_and(|visibility_ids| visibility_ids.contains(visibility_id)),
+                    "unresolved visibility missing owner/member forward edge"
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_visibility_definitions_exist(&self, definitions: &IdentityHashMap<DefinitionId, Definition>) {
+        for visibility_id in self.owner_by_visibility.keys() {
+            assert!(
+                matches!(definitions.get(visibility_id), Some(Definition::MethodVisibility(_))),
+                "unresolved method visibility index references a missing or non-visibility definition"
+            );
+        }
     }
 }

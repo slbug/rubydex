@@ -968,6 +968,14 @@ class Foo; private :foo; end  # works — retroactive across reopen
 Foo.private_instance_methods(false)  # => [:foo]
 ```
 
+The method must already exist when the visibility call runs. Within one file, `private :foo` before `def foo` matches
+Ruby's `NameError` behavior. Across files, Rubydex cannot know runtime load order, so it treats cross-file definitions
+as potentially available. A definitely-prior same-file definition is preferred for the visibility snapshot; URI lexical
+order is used only as a deterministic tie-breaker when multiple cross-file definitions could apply.
+
+Rubydex treats visibility calls inside method bodies or ordinary blocks as runtime calls. It does not apply those
+visibility effects statically because Ruby only executes them if the containing method or block is called.
+
 **`private :inherited_method` creates an implicit copy:**
 
 ```ruby
@@ -1039,8 +1047,8 @@ Foo.singleton_methods(false)          # => [:foo]
 Ruby can invoke `module_function` indirectly with `send` on a module object. Rubydex indexes the direct call forms above;
 dynamic `send` calls are treated as ordinary method calls rather than visibility operations.
 
-Rubydex also treats `module_function` calls inside method bodies or ordinary blocks as runtime calls. It does not apply
-those visibility effects statically because Ruby only executes them if the containing method or block is called.
+Like other visibility operations, Rubydex treats `module_function` calls inside method bodies or ordinary blocks as
+runtime calls rather than static visibility operations.
 
 **Creates a copy, not a reference:**
 
@@ -1077,8 +1085,9 @@ invalidate and rebuild generated copies when the source file changes, because a 
 copy the current source method at the `module_function :foo` call.
 
 When the source method and `module_function :foo` call are in different files, static indexing does not know runtime
-load order. Rubydex uses URI lexical order as a deterministic proxy: methods in earlier URI-sorted files are eligible
-for later URI-sorted visibility calls, while methods in later files are not. Within one file, the source method must
+load order. Rubydex treats cross-file source methods as potentially available and uses URI lexical order only as a
+deterministic tie-breaker when multiple cross-file definitions could be copied. A definitely-prior same-file source
+method is preferred over cross-file candidates. Within one file, the source method must
 appear before the `module_function :foo` call, matching Ruby's `NameError` behavior for calls that appear before the
 method definition.
 
@@ -1134,6 +1143,9 @@ Foo.constants  # => [] (private constants hidden from .constants)
 - `Foo.constants` excludes private constants
 - `Foo.const_defined?(:PRIV)` returns **true** even for private constants — visibility doesn't affect `const_defined?`
 - `Foo.const_get(:PRIV)` **bypasses** private constant visibility and returns the value — only the `::` operator enforces `private_constant`
+
+Rubydex treats `private_constant`/`public_constant` calls inside method bodies or ordinary blocks as runtime calls rather
+than static visibility operations.
 
 #### `public_constant`
 

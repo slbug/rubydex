@@ -195,6 +195,41 @@ impl Definition {
     pub fn is_deprecated(&self) -> bool {
         all_definitions!(self, it => it.flags().is_deprecated())
     }
+
+    #[must_use]
+    pub fn method_effective_visibility(&self) -> Option<Visibility> {
+        match self {
+            Definition::MethodVisibility(vis) => Some(match vis.visibility() {
+                Visibility::ModuleFunction => Visibility::Private,
+                visibility => *visibility,
+            }),
+            Definition::Method(method) => Some(*method.visibility()),
+            Definition::AttrAccessor(attr) => Some(*attr.visibility()),
+            Definition::AttrReader(attr) => Some(*attr.visibility()),
+            Definition::AttrWriter(attr) => Some(*attr.visibility()),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn establishes_method_member(&self) -> bool {
+        matches!(
+            self,
+            Definition::Method(_)
+                | Definition::MethodAlias(_)
+                | Definition::AttrAccessor(_)
+                | Definition::AttrReader(_)
+                | Definition::AttrWriter(_)
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn is_copyable_method_body(&self) -> bool {
+        matches!(
+            self,
+            Definition::Method(_) | Definition::AttrAccessor(_) | Definition::AttrReader(_) | Definition::AttrWriter(_)
+        )
+    }
 }
 
 /// Represents a mixin: include, prepend, or extend.
@@ -1121,7 +1156,12 @@ impl ParameterStruct {
     }
 }
 
-/// An attr accessor definition
+/// The reader-side method definition created by `attr_accessor`.
+///
+/// The writer side is indexed separately as an `AttrWriterDefinition` for the
+/// generated `foo=()` method. Keeping the reader and writer as separate method
+/// declarations lets visibility changes and `module_function :foo=` target the
+/// same methods Ruby creates.
 ///
 /// # Example
 /// ```ruby

@@ -5108,7 +5108,7 @@ mod visibility_resolution_tests {
     }
 
     #[test]
-    fn retroactive_module_function_uses_uri_order_for_cross_file_source_selection() {
+    fn retroactive_module_function_uses_uri_order_to_tie_break_cross_file_source_selection() {
         let mut context = GraphTest::new();
         context.index_uri(
             "file:///a_source.rb",
@@ -5138,12 +5138,43 @@ mod visibility_resolution_tests {
 
         assert_no_diagnostics!(&context);
         assert_visibility_eq!(context, "Foo::<Foo>#bar()", Visibility::Public);
+        assert_eq!(method_required_parameter_count(&context, "Foo::<Foo>#bar()"), 2);
+        assert_eq!(
+            method_required_parameter_names(&context, "Foo::<Foo>#bar()"),
+            ["first", "second"]
+        );
+    }
+
+    #[test]
+    fn retroactive_module_function_prefers_same_file_source_over_cross_file_tie_breaker() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///z_source.rb",
+            r"
+            module Foo
+              def bar(first, second); end
+            end
+            ",
+        );
+        context.index_uri(
+            "file:///m_visibility.rb",
+            r"
+            module Foo
+              def bar(first); end
+              module_function :bar
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_visibility_eq!(context, "Foo::<Foo>#bar()", Visibility::Public);
         assert_eq!(method_required_parameter_count(&context, "Foo::<Foo>#bar()"), 1);
         assert_eq!(method_required_parameter_names(&context, "Foo::<Foo>#bar()"), ["first"]);
     }
 
     #[test]
-    fn retroactive_module_function_ignores_cross_file_source_after_visibility_uri() {
+    fn retroactive_module_function_allows_cross_file_source_after_visibility_uri() {
         let mut context = GraphTest::new();
         context.index_uri(
             "file:///z_source.rb",
@@ -5163,15 +5194,137 @@ mod visibility_resolution_tests {
         );
         context.resolve();
 
-        assert_declaration_does_not_exist!(context, "Foo::<Foo>#bar()");
-        assert_diagnostics_eq!(
-            &context,
-            vec!["undefined-method-visibility-target: undefined method `Foo#bar()` for visibility change (2:20-2:23)"]
-        );
+        assert_no_diagnostics!(&context);
+        assert_visibility_eq!(context, "Foo::<Foo>#bar()", Visibility::Public);
+        assert_eq!(method_required_parameter_count(&context, "Foo::<Foo>#bar()"), 1);
     }
 
     #[test]
-    fn inherited_retroactive_module_function_uses_uri_order_for_cross_file_visibility_snapshot() {
+    fn singleton_visibility_after_module_function_sees_generated_copy() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///foo.rb",
+            r"
+            module M
+              def foo; end
+              module_function :foo
+              private_class_method :foo
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_visibility_eq!(context, "M#foo()", Visibility::Private);
+        assert_visibility_eq!(context, "M::<M>#foo()", Visibility::Private);
+    }
+
+    #[test]
+    fn singleton_visibility_before_module_function_does_not_see_generated_copy() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///foo.rb",
+            r"
+            module M
+              def foo; end
+              private_class_method :foo
+              module_function :foo
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_diagnostics_eq!(
+            context,
+            &["undefined-method-visibility-target: undefined method `M::<M>#foo()` for visibility change (3:25-3:28)"]
+        );
+        assert_visibility_eq!(context, "M#foo()", Visibility::Private);
+        assert_visibility_eq!(context, "M::<M>#foo()", Visibility::Public);
+    }
+
+    #[test]
+    fn singleton_visibility_before_module_function_stays_unresolved_after_incremental_reorder() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///foo.rb",
+            r"
+            module M
+              def foo; end
+              module_function :foo
+              private_class_method :foo
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_visibility_eq!(context, "M::<M>#foo()", Visibility::Private);
+
+        context.index_uri(
+            "file:///foo.rb",
+            r"
+            module M
+              def foo; end
+              private_class_method :foo
+              module_function :foo
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_diagnostics_eq!(
+            context,
+            &["undefined-method-visibility-target: undefined method `M::<M>#foo()` for visibility change (3:25-3:28)"]
+        );
+        assert_visibility_eq!(context, "M::<M>#foo()", Visibility::Public);
+    }
+
+    #[test]
+    fn singleton_visibility_requeues_when_generated_copy_loses_cross_file_trigger() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///a_source.rb",
+            r"
+            module M
+              def foo; end
+            end
+            ",
+        );
+        context.index_uri(
+            "file:///a_trigger.rb",
+            r"
+            module M
+              module_function :foo
+            end
+            ",
+        );
+        context.index_uri(
+            "file:///b_visibility.rb",
+            r"
+            module M
+              private_class_method :foo
+              module_function :foo
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_visibility_eq!(context, "M::<M>#foo()", Visibility::Private);
+
+        context.delete_uri("file:///a_trigger.rb");
+        context.resolve();
+
+        assert_diagnostics_eq!(
+            context,
+            &["undefined-method-visibility-target: undefined method `M::<M>#foo()` for visibility change (2:25-2:28)"]
+        );
+        assert_visibility_eq!(context, "M#foo()", Visibility::Private);
+        assert_visibility_eq!(context, "M::<M>#foo()", Visibility::Public);
+    }
+
+    #[test]
+    fn inherited_retroactive_module_function_uses_uri_order_to_tie_break_cross_file_visibility_snapshot() {
         let mut context = GraphTest::new();
         context.index_uri(
             "file:///a_source.rb",
@@ -5202,9 +5355,9 @@ mod visibility_resolution_tests {
         context.resolve();
 
         assert_no_diagnostics!(&context);
-        assert_declaration_does_not_exist!(context, "B#foo()");
+        assert_visibility_eq!(context, "B#foo()", Visibility::Private);
         assert_visibility_eq!(context, "B::<B>#foo()", Visibility::Public);
-        assert_eq!(method_required_parameter_count(&context, "B::<B>#foo()"), 0);
+        assert_eq!(method_required_parameter_count(&context, "B::<B>#foo()"), 1);
     }
 
     #[test]
@@ -6012,6 +6165,58 @@ mod visibility_resolution_tests {
     }
 
     #[test]
+    fn inherited_retroactive_module_function_copy_updates_when_higher_priority_ancestor_method_is_added() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///low.rb",
+            r"
+            module Low
+              def foo(x); end
+            end
+            ",
+        );
+        context.index_uri(
+            "file:///high.rb",
+            r"
+            module High
+              include Low
+            end
+            ",
+        );
+        context.index_uri(
+            "file:///child.rb",
+            r"
+            module Child
+              include High
+              module_function :foo
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_eq!(method_required_parameter_count(&context, "Child#foo()"), 1);
+        assert_eq!(method_required_parameter_count(&context, "Child::<Child>#foo()"), 1);
+
+        context.index_uri(
+            "file:///high.rb",
+            r"
+            module High
+              include Low
+              def foo(x, y); end
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_visibility_eq!(context, "Child#foo()", Visibility::Private);
+        assert_visibility_eq!(context, "Child::<Child>#foo()", Visibility::Public);
+        assert_eq!(method_required_parameter_count(&context, "Child#foo()"), 2);
+        assert_eq!(method_required_parameter_count(&context, "Child::<Child>#foo()"), 2);
+    }
+
+    #[test]
     fn inherited_retroactive_module_function_copy_clears_when_source_method_is_removed() {
         let mut context = GraphTest::new();
         context.index_uri(
@@ -6378,6 +6583,190 @@ mod visibility_resolution_tests {
     }
 
     #[test]
+    fn retroactive_visibility_before_method_definition_emits_diagnostic() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///foo.rb",
+            r"
+            class Foo
+              private :bar
+              def bar; end
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_diagnostics_eq!(
+            context,
+            &["undefined-method-visibility-target: undefined method `Foo#bar()` for visibility change (2:12-2:15)"]
+        );
+        assert_visibility_eq!(context, "Foo#bar()", Visibility::Public);
+    }
+
+    #[test]
+    fn runtime_method_visibility_call_in_method_body_does_not_apply_statically() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///foo.rb",
+            r"
+            class Foo
+              def toggle
+                private :bar
+              end
+
+              def bar; end
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_visibility_eq!(context, "Foo#bar()", Visibility::Public);
+    }
+
+    #[test]
+    fn runtime_method_visibility_call_in_block_does_not_apply_statically() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///foo.rb",
+            r"
+            class Foo
+              proc do
+                private :bar
+              end
+
+              def bar; end
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_visibility_eq!(context, "Foo#bar()", Visibility::Public);
+    }
+
+    #[test]
+    fn retroactive_visibility_detaches_when_direct_source_method_is_removed() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///a_foo.rb",
+            r"
+            class Foo
+              def bar; end
+            end
+            ",
+        );
+        context.index_uri(
+            "file:///b_visibility.rb",
+            r"
+            class Foo
+              private :bar
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_visibility_eq!(context, "Foo#bar()", Visibility::Private);
+
+        context.index_uri(
+            "file:///a_foo.rb",
+            r"
+            class Foo
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_diagnostics_eq!(
+            context,
+            &["undefined-method-visibility-target: undefined method `Foo#bar()` for visibility change (2:12-2:15)"]
+        );
+        assert_declaration_does_not_exist!(context, "Foo#bar()");
+    }
+
+    #[test]
+    fn inherited_retroactive_visibility_resolves_when_ancestor_method_is_added() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///m.rb",
+            r"
+            module M
+            end
+            ",
+        );
+        context.index_uri(
+            "file:///child.rb",
+            r"
+            module Child
+              include M
+              private :foo
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_diagnostics_eq!(
+            context,
+            &["undefined-method-visibility-target: undefined method `Child#foo()` for visibility change (3:12-3:15)"]
+        );
+
+        context.index_uri(
+            "file:///m.rb",
+            r"
+            module M
+              def foo; end
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_visibility_eq!(context, "Child#foo()", Visibility::Private);
+    }
+
+    #[test]
+    fn inherited_retroactive_visibility_requeues_when_ancestor_method_is_removed() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///m.rb",
+            r"
+            module M
+              def foo; end
+            end
+            ",
+        );
+        context.index_uri(
+            "file:///child.rb",
+            r"
+            module Child
+              include M
+              private :foo
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_visibility_eq!(context, "Child#foo()", Visibility::Private);
+
+        context.index_uri(
+            "file:///m.rb",
+            r"
+            module M
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_diagnostics_eq!(
+            context,
+            &["undefined-method-visibility-target: undefined method `Child#foo()` for visibility change (3:12-3:15)"]
+        );
+        assert_declaration_does_not_exist!(context, "Child#foo()");
+    }
+
+    #[test]
     fn retroactive_visibility_undefined_target_diagnostic_clears_when_visibility_file_deleted() {
         let mut context = GraphTest::new();
         context.index_uri(
@@ -6444,7 +6833,7 @@ mod visibility_resolution_tests {
         assert_declaration_does_not_exist!(context, "Child#foo()");
 
         context.index_uri(
-            "file:///module.rb",
+            "file:///a_module.rb",
             r"
             module M
               def foo; end
@@ -6457,6 +6846,347 @@ mod visibility_resolution_tests {
         assert_declaration_exists!(context, "Child#foo()");
         assert_owner_eq!(context, "Child#foo()", "Child");
         assert_visibility_eq!(context, "Child#foo()", Visibility::Private);
+    }
+
+    #[test]
+    fn retroactive_visibility_resolves_when_known_ancestor_method_is_added_incrementally() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///a_parent.rb",
+            r"
+            class Parent
+            end
+            ",
+        );
+        context.index_uri(
+            "file:///b_child.rb",
+            r"
+            class Child < Parent
+              private :foo
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_diagnostics_eq!(
+            context,
+            &["undefined-method-visibility-target: undefined method `Child#foo()` for visibility change (2:12-2:15)"]
+        );
+        assert_declaration_does_not_exist!(context, "Child#foo()");
+
+        context.index_uri(
+            "file:///a_parent.rb",
+            r"
+            class Parent
+              def foo; end
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_declaration_exists!(context, "Child#foo()");
+        assert_owner_eq!(context, "Child#foo()", "Child");
+        assert_visibility_eq!(context, "Child#foo()", Visibility::Private);
+    }
+
+    #[test]
+    fn retroactive_visibility_allows_cross_file_source_after_visibility_uri() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///z_source.rb",
+            r"
+            class Foo
+              def bar; end
+            end
+            ",
+        );
+        context.index_uri(
+            "file:///a_visibility.rb",
+            r"
+            class Foo
+              private :bar
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_visibility_eq!(context, "Foo#bar()", Visibility::Private);
+    }
+
+    #[test]
+    fn retroactive_visibility_snapshot_prefers_same_file_visibility_over_cross_file_tie_breaker() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///z_source.rb",
+            r"
+            module A
+              def bar; end
+              public :bar
+            end
+            ",
+        );
+        context.index_uri(
+            "file:///m_visibility.rb",
+            r"
+            module A
+              def bar; end
+              private :bar
+            end
+
+            module B
+              include A
+              module_function :bar
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_declaration_does_not_exist!(context, "B#bar()");
+        assert_visibility_eq!(context, "B::<B>#bar()", Visibility::Public);
+    }
+
+    #[test]
+    fn retroactive_visibility_detaches_when_inherited_source_method_is_removed() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///a_parent.rb",
+            r"
+            class Parent
+              def foo; end
+            end
+            ",
+        );
+        context.index_uri(
+            "file:///b_child.rb",
+            r"
+            class Child < Parent
+              private :foo
+              public :foo
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_declaration_exists!(context, "Child#foo()");
+        assert_owner_eq!(context, "Child#foo()", "Child");
+        assert_visibility_eq!(context, "Child#foo()", Visibility::Public);
+
+        context.index_uri(
+            "file:///a_parent.rb",
+            r"
+            class Parent
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_diagnostics_eq!(
+            context,
+            &[
+                "undefined-method-visibility-target: undefined method `Child#foo()` for visibility change (2:12-2:15)",
+                "undefined-method-visibility-target: undefined method `Child#foo()` for visibility change (3:11-3:14)",
+            ]
+        );
+        assert_declaration_does_not_exist!(context, "Child#foo()");
+    }
+
+    #[test]
+    fn applied_visibility_index_is_cleaned_when_visibility_document_is_reindexed() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///visibility.rb",
+            r"
+            class Old
+              def foo; end
+              private :foo
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_visibility_eq!(context, "Old#foo()", Visibility::Private);
+        context.graph().assert_method_visibility_indexes_consistent();
+
+        context.index_uri(
+            "file:///visibility.rb",
+            r"
+            class New
+              def foo; end
+              private :foo
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_declaration_does_not_exist!(context, "Old#foo()");
+        assert_visibility_eq!(context, "New#foo()", Visibility::Private);
+        context.graph().assert_method_visibility_indexes_consistent();
+
+        context.index_uri(
+            "file:///old.rb",
+            r"
+            class Old
+              def foo; end
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_visibility_eq!(context, "Old#foo()", Visibility::Public);
+        assert_visibility_eq!(context, "New#foo()", Visibility::Private);
+        context.graph().assert_method_visibility_indexes_consistent();
+    }
+
+    #[test]
+    fn retroactive_visibility_detaches_when_inherited_alias_is_removed() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///a_mixin.rb",
+            r"
+            module Mixin
+              def original; end
+              alias copied original
+            end
+            ",
+        );
+        context.index_uri(
+            "file:///b_child.rb",
+            r"
+            class Child
+              include Mixin
+              private :copied
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_declaration_exists!(context, "Child#copied()");
+        assert_owner_eq!(context, "Child#copied()", "Child");
+        assert_visibility_eq!(context, "Child#copied()", Visibility::Private);
+
+        context.index_uri(
+            "file:///a_mixin.rb",
+            r"
+            module Mixin
+              def original; end
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_diagnostics_eq!(
+            context,
+            &[
+                "undefined-method-visibility-target: undefined method `Child#copied()` for visibility change (3:12-3:18)"
+            ]
+        );
+        assert_declaration_does_not_exist!(context, "Child#copied()");
+    }
+
+    #[test]
+    fn retroactive_visibility_detaches_when_included_source_method_is_removed() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///a_mixin.rb",
+            r"
+            module Mixin
+              def foo; end
+            end
+            ",
+        );
+        context.index_uri(
+            "file:///b_child.rb",
+            r"
+            class Child
+              include Mixin
+              private :foo
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_declaration_exists!(context, "Child#foo()");
+        assert_owner_eq!(context, "Child#foo()", "Child");
+        assert_visibility_eq!(context, "Child#foo()", Visibility::Private);
+
+        context.index_uri(
+            "file:///a_mixin.rb",
+            r"
+            module Mixin
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_diagnostics_eq!(
+            context,
+            &["undefined-method-visibility-target: undefined method `Child#foo()` for visibility change (3:12-3:15)"]
+        );
+        assert_declaration_does_not_exist!(context, "Child#foo()");
+    }
+
+    #[test]
+    fn retroactive_visibility_detaches_when_include_chain_stops_providing_method() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///a_sources.rb",
+            r"
+            module Source
+              def foo; end
+            end
+
+            module Empty
+            end
+            ",
+        );
+        context.index_uri(
+            "file:///b_mixin.rb",
+            r"
+            module Mixin
+              include Source
+            end
+            ",
+        );
+        context.index_uri(
+            "file:///c_child.rb",
+            r"
+            class Child
+              include Mixin
+              private :foo
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_declaration_exists!(context, "Child#foo()");
+        assert_owner_eq!(context, "Child#foo()", "Child");
+        assert_visibility_eq!(context, "Child#foo()", Visibility::Private);
+
+        context.index_uri(
+            "file:///b_mixin.rb",
+            r"
+            module Mixin
+              include Empty
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_diagnostics_eq!(
+            context,
+            &["undefined-method-visibility-target: undefined method `Child#foo()` for visibility change (3:12-3:15)"]
+        );
+        assert_declaration_does_not_exist!(context, "Child#foo()");
     }
 
     #[test]
@@ -6490,6 +7220,27 @@ mod visibility_resolution_tests {
         assert_visibility_eq!(context, "Foo::QUX", Visibility::Public);
         assert_visibility_eq!(context, "Foo::Inner", Visibility::Private);
         assert_visibility_eq!(context, "Foo::InnerMod", Visibility::Private);
+    }
+
+    #[test]
+    fn runtime_constant_visibility_call_in_block_does_not_apply_statically() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///foo.rb",
+            r"
+            class Foo
+              BAR = 1
+
+              proc do
+                private_constant :BAR
+              end
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_visibility_eq!(context, "Foo::BAR", Visibility::Public);
     }
 
     #[test]
@@ -6705,6 +7456,29 @@ mod visibility_resolution_tests {
     }
 
     #[test]
+    fn retroactive_singleton_method_visibility_before_method_definition_emits_diagnostic() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///foo.rb",
+            r"
+            class Foo
+              private_class_method :bar
+              def self.bar; end
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_diagnostics_eq!(
+            context,
+            &[
+                "undefined-method-visibility-target: undefined method `Foo::<Foo>#bar()` for visibility change (2:25-2:28)"
+            ]
+        );
+        assert_visibility_eq!(context, "Foo::<Foo>#bar()", Visibility::Public);
+    }
+
+    #[test]
     fn retroactive_singleton_method_visibility_undefined_target_diagnostic_clears_when_file_deleted() {
         let mut context = GraphTest::new();
         context.index_uri(
@@ -6770,6 +7544,82 @@ mod visibility_resolution_tests {
 
         assert_no_diagnostics!(&context);
         assert_visibility_eq!(context, "Foo::<Foo>#missing()", Visibility::Private);
+    }
+
+    #[test]
+    fn retroactive_singleton_method_visibility_resolves_when_target_added_incrementally() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///b_visibility.rb",
+            r"
+            module Foo
+              private_class_method :bar
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_diagnostics_eq!(
+            context,
+            &[
+                "undefined-method-visibility-target: undefined method `Foo::<Foo>#bar()` for visibility change (2:25-2:28)"
+            ]
+        );
+
+        context.index_uri(
+            "file:///a_method.rb",
+            r"
+            module Foo
+              def self.bar; end
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_visibility_eq!(context, "Foo::<Foo>#bar()", Visibility::Private);
+    }
+
+    #[test]
+    fn runtime_singleton_method_visibility_call_in_method_body_does_not_apply_statically() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///foo.rb",
+            r"
+            class Foo
+              def toggle
+                private_class_method :bar
+              end
+
+              def self.bar; end
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_visibility_eq!(context, "Foo::<Foo>#bar()", Visibility::Public);
+    }
+
+    #[test]
+    fn runtime_singleton_method_visibility_call_in_block_does_not_apply_statically() {
+        let mut context = GraphTest::new();
+        context.index_uri(
+            "file:///foo.rb",
+            r"
+            class Foo
+              proc do
+                private_class_method :bar
+              end
+
+              def self.bar; end
+            end
+            ",
+        );
+        context.resolve();
+
+        assert_no_diagnostics!(&context);
+        assert_visibility_eq!(context, "Foo::<Foo>#bar()", Visibility::Public);
     }
 
     #[test]

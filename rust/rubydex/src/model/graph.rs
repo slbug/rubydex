@@ -3,14 +3,16 @@ use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 
-use crate::diagnostic::{Diagnostic, Rule};
+mod visibility;
+
+use crate::diagnostic::Diagnostic;
 use crate::indexing::local_graph::LocalGraph;
 use crate::model::built_in::{OBJECT_ID, add_built_in_data};
 use crate::model::declaration::{Ancestor, Declaration, Namespace};
 use crate::model::definitions::{Definition, MethodVisibilityDefinition, Receiver};
 use crate::model::document::Document;
 use crate::model::encoding::Encoding;
-use crate::model::graph_indexes::{ModuleFunctionCopies, UnresolvedMethodVisibilities};
+use crate::model::graph_indexes::{AppliedMethodVisibilities, ModuleFunctionCopies, UnresolvedMethodVisibilities};
 use crate::model::identity_maps::{IdentityHashMap, IdentityHashSet};
 use crate::model::ids::{ConstantReferenceId, DeclarationId, DefinitionId, MethodReferenceId, NameId, StringId, UriId};
 use crate::model::name::{Name, NameRef, ParentScope, ResolvedName};
@@ -30,6 +32,35 @@ pub enum NameDependent {
     ChildName(NameId),
     /// This name's `nesting` is the key name — reference-only dependency.
     NestedName(NameId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DefinitionProgramOrderKey<'a> {
+    id: DefinitionId,
+    uri: &'a str,
+    offset: &'a Offset,
+}
+
+impl<'a> DefinitionProgramOrderKey<'a> {
+    #[must_use]
+    pub(crate) fn new(id: DefinitionId, uri: &'a str, offset: &'a Offset) -> Self {
+        Self { id, uri, offset }
+    }
+}
+
+impl Ord for DefinitionProgramOrderKey<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.uri
+            .cmp(other.uri)
+            .then_with(|| self.offset.cmp(other.offset))
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+impl PartialOrd for DefinitionProgramOrderKey<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// Items processed by the unified invalidation worklist.
@@ -86,6 +117,7 @@ pub struct Graph {
 
     module_function_copies: ModuleFunctionCopies,
     unresolved_method_visibilities: UnresolvedMethodVisibilities,
+    applied_method_visibilities: AppliedMethodVisibilities,
 
     /// Paths to exclude from file discovery during indexing.
     excluded_paths: HashSet<PathBuf>,
@@ -107,6 +139,7 @@ impl Graph {
             pending_work: Vec::default(),
             module_function_copies: ModuleFunctionCopies::default(),
             unresolved_method_visibilities: UnresolvedMethodVisibilities::default(),
+            applied_method_visibilities: AppliedMethodVisibilities::default(),
             excluded_paths: HashSet::new(),
         };
 
@@ -194,349 +227,9 @@ impl Graph {
         declaration_id
     }
 
-    pub(crate) fn add_method_visibility_declaration<F>(
-        &mut self,
-        definition_id: DefinitionId,
-        fully_qualified_name: String,
-        constructor: F,
-    ) -> DeclarationId
-    where
-        F: FnOnce(String) -> Declaration,
-    {
-        self.add_ordered_declaration(definition_id, definition_id, fully_qualified_name, constructor)
-    }
-
-    pub(crate) fn add_module_function_copy_declaration<F>(
-        &mut self,
-        definition_id: DefinitionId,
-        visibility_definition_id: DefinitionId,
-        fully_qualified_name: String,
-        constructor: F,
-    ) -> DeclarationId
-    where
-        F: FnOnce(String) -> Declaration,
-    {
-        self.add_ordered_declaration(
-            definition_id,
-            visibility_definition_id,
-            fully_qualified_name,
-            constructor,
-        )
-    }
-
-    fn add_ordered_declaration<F>(
-        &mut self,
-        definition_id: DefinitionId,
-        ordering_visibility_definition_id: DefinitionId,
-        fully_qualified_name: String,
-        constructor: F,
-    ) -> DeclarationId
-    where
-        F: FnOnce(String) -> Declaration,
-    {
-        let declaration_id = DeclarationId::from(&fully_qualified_name);
-        let insert_index = self.method_visibility_insert_index(declaration_id, ordering_visibility_definition_id);
-
-        match self.declarations.entry(declaration_id) {
-            Entry::Occupied(mut occupied_entry) => {
-                debug_assert!(
-                    occupied_entry.get().name() == fully_qualified_name,
-                    "DeclarationId collision in global graph"
-                );
-
-                if let Some(index) = insert_index {
-                    occupied_entry.get_mut().insert_definition(definition_id, index);
-                } else {
-                    occupied_entry.get_mut().add_definition(definition_id);
-                }
-            }
-            Entry::Vacant(vacant_entry) => {
-                let mut declaration = constructor(fully_qualified_name);
-                declaration.add_definition(definition_id);
-                vacant_entry.insert(declaration);
-            }
-        }
-
-        declaration_id
-    }
-
-    fn method_visibility_insert_index(
-        &self,
-        declaration_id: DeclarationId,
-        visibility_definition_id: DefinitionId,
-    ) -> Option<usize> {
-        let Definition::MethodVisibility(_) = self.definitions.get(&visibility_definition_id)? else {
-            return None;
-        };
-
-        self.declarations
-            .get(&declaration_id)?
-            .definitions()
-            .iter()
-            .position(|definition_id| {
-                self.compare_definitions_by_program_order(visibility_definition_id, *definition_id)
-                    .is_some_and(Ordering::is_lt)
-            })
-    }
-
-    pub(crate) fn add_module_function_copy(
-        &mut self,
-        source_definition_id: DefinitionId,
-        visibility_definition_id: DefinitionId,
-        copy_declaration_id: DeclarationId,
-        definition: Definition,
-    ) -> DefinitionId {
-        let definition_id = definition.id();
-
-        if let Some(copy) = self.module_function_copies.get(definition_id) {
-            debug_assert_eq!(
-                copy.source_definition_id, source_definition_id,
-                "Module function copy ID collision with different source definition"
-            );
-            debug_assert_eq!(
-                copy.declaration_id, copy_declaration_id,
-                "Module function copy ID collision with different declaration"
-            );
-            self.attach_module_function_copy_visibility(definition_id, visibility_definition_id);
-            return definition_id;
-        }
-
-        if self.definitions.contains_key(&definition_id) {
-            // `module_function def foo; end` already indexes the public singleton copy as
-            // a real document-owned definition. A later `module_function :foo` can compute
-            // the same copied method ID. Reuse that definition; its lifetime is still owned
-            // by the source document, not by the generated-copy tracker.
-            self.module_function_copies
-                .attach_document_owned_visibility(source_definition_id, visibility_definition_id);
-            return definition_id;
-        }
-
-        self.track_definition_strings(&definition);
-        self.definitions.insert(definition_id, definition);
-        self.module_function_copies.insert(
-            definition_id,
-            source_definition_id,
-            visibility_definition_id,
-            copy_declaration_id,
-        );
-
-        definition_id
-    }
-
-    pub(crate) fn find_module_function_copy(
-        &self,
-        source_definition_id: DefinitionId,
-        copy_declaration_id: DeclarationId,
-    ) -> Option<DefinitionId> {
-        self.module_function_copies
-            .find(source_definition_id, copy_declaration_id)
-    }
-
-    pub(crate) fn attach_module_function_copy_visibility(
-        &mut self,
-        copy_definition_id: DefinitionId,
-        visibility_definition_id: DefinitionId,
-    ) {
-        self.module_function_copies
-            .attach_visibility(copy_definition_id, visibility_definition_id);
-    }
-
-    pub(crate) fn track_module_function_alias_dependency(
-        &mut self,
-        alias_definition_id: DefinitionId,
-        visibility_definition_id: DefinitionId,
-    ) {
-        self.module_function_copies
-            .track_alias_dependent_visibility(alias_definition_id, visibility_definition_id);
-    }
-
-    pub(crate) fn track_module_function_ancestor_dependency(
-        &mut self,
-        owner_id: DeclarationId,
-        visibility_definition_id: DefinitionId,
-    ) {
-        self.module_function_copies
-            .track_ancestor_dependent_visibility(owner_id, visibility_definition_id);
-    }
-
-    pub(crate) fn track_unresolved_method_visibility(
-        &mut self,
-        owner_id: DeclarationId,
-        visibility_definition_id: DefinitionId,
-    ) {
-        self.unresolved_method_visibilities
-            .track(owner_id, visibility_definition_id);
-    }
-
-    pub(crate) fn mark_method_visibility_resolved(&mut self, visibility_definition_id: DefinitionId) {
-        if let Some(owner_id) = self.remove_unresolved_method_visibility(visibility_definition_id) {
-            self.remove_unresolved_method_visibility_diagnostic(owner_id, visibility_definition_id);
-        }
-    }
-
-    fn remove_unresolved_method_visibility(&mut self, visibility_definition_id: DefinitionId) -> Option<DeclarationId> {
-        self.unresolved_method_visibilities.remove(visibility_definition_id)
-    }
-
-    fn requeue_unresolved_method_visibilities_for_owner(&mut self, owner_id: DeclarationId) {
-        let visibility_ids = self.unresolved_method_visibilities.visibility_ids_for_owner(owner_id);
-
-        for visibility_id in visibility_ids {
-            self.remove_unresolved_method_visibility_diagnostic(owner_id, visibility_id);
-            self.push_work(Unit::Definition(visibility_id));
-        }
-    }
-
-    fn remove_unresolved_method_visibility_diagnostic(
-        &mut self,
-        owner_id: DeclarationId,
-        visibility_definition_id: DefinitionId,
-    ) {
-        let Some(Definition::MethodVisibility(visibility_definition)) = self.definitions.get(&visibility_definition_id)
-        else {
-            return;
-        };
-        let uri_id = *visibility_definition.uri_id();
-        let offset = visibility_definition.offset().clone();
-
-        if let Some(declaration) = self.declarations.get_mut(&owner_id) {
-            declaration.retain_diagnostics(|diagnostic| {
-                diagnostic.rule() != &Rule::UndefinedMethodVisibilityTarget
-                    || diagnostic.uri_id() != &uri_id
-                    || diagnostic.offset() != &offset
-            });
-        }
-    }
-
-    fn remove_module_function_copies_for_source(&mut self, source_definition_id: DefinitionId) -> Vec<DefinitionId> {
-        let mut visibility_definition_ids = self
-            .module_function_copies
-            .take_document_owned_visibility_ids_for_source(source_definition_id)
-            .into_iter()
-            .filter(|visibility_id| self.definitions.contains_key(visibility_id))
-            .collect::<Vec<_>>();
-        let copy_ids = self.module_function_copies.copy_ids_for_source(source_definition_id);
-
-        for copy_id in copy_ids {
-            self.remove_module_function_copy_and_collect_visibility_work(copy_id, &mut visibility_definition_ids);
-        }
-
-        visibility_definition_ids
-    }
-
-    fn remove_module_function_copies_for_alias(&mut self, alias_definition_id: DefinitionId) -> Vec<DefinitionId> {
-        let mut visibility_ids = self
-            .module_function_copies
-            .take_alias_dependent_visibility_ids_for_alias(alias_definition_id)
-            .into_iter()
-            .filter(|visibility_id| self.definitions.contains_key(visibility_id))
-            .collect::<Vec<_>>();
-
-        for visibility_id in visibility_ids.clone() {
-            for dependent_visibility_id in self.remove_module_function_copy_for_visibility(visibility_id) {
-                self.push_existing_visibility_work(dependent_visibility_id, &mut visibility_ids);
-            }
-        }
-
-        visibility_ids
-    }
-
-    fn remove_module_function_copy_for_visibility(
-        &mut self,
-        visibility_definition_id: DefinitionId,
-    ) -> Vec<DefinitionId> {
-        let mut visibility_definition_ids = Vec::new();
-
-        self.module_function_copies
-            .detach_document_owned_visibility(visibility_definition_id);
-        self.module_function_copies
-            .detach_alias_dependent_visibility(visibility_definition_id);
-        self.module_function_copies
-            .detach_ancestor_dependent_visibility(visibility_definition_id);
-
-        for copy_definition_id in self.module_function_copies.detach_visibility(visibility_definition_id) {
-            self.remove_module_function_copy_and_collect_visibility_work(
-                copy_definition_id,
-                &mut visibility_definition_ids,
-            );
-        }
-
-        visibility_definition_ids
-    }
-
-    fn requeue_module_function_copies_for_owner(&mut self, owner_id: DeclarationId) {
-        let visibility_ids = self
-            .module_function_copies
-            .take_ancestor_dependent_visibility_ids_for_owner(owner_id);
-
-        for visibility_id in visibility_ids {
-            self.module_function_copies
-                .detach_alias_dependent_visibility(visibility_id);
-            for copy_definition_id in self.module_function_copies.detach_visibility(visibility_id) {
-                let mut dependent_visibility_ids = Vec::new();
-                self.remove_module_function_copy_and_collect_visibility_work(
-                    copy_definition_id,
-                    &mut dependent_visibility_ids,
-                );
-                for dependent_visibility_id in dependent_visibility_ids {
-                    if self.definitions.contains_key(&dependent_visibility_id) {
-                        self.push_work(Unit::Definition(dependent_visibility_id));
-                    }
-                }
-            }
-
-            if self.definitions.contains_key(&visibility_id) {
-                self.push_work(Unit::Definition(visibility_id));
-            }
-        }
-    }
-
-    fn remove_module_function_copy_and_collect_visibility_work(
-        &mut self,
-        copy_definition_id: DefinitionId,
-        visibility_definition_ids: &mut Vec<DefinitionId>,
-    ) {
-        let dependent_copy_ids = self.module_function_copies.copy_ids_for_source(copy_definition_id);
-        for dependent_copy_id in dependent_copy_ids {
-            self.remove_module_function_copy_and_collect_visibility_work(dependent_copy_id, visibility_definition_ids);
-        }
-
-        for visibility_id in self.remove_module_function_copy(copy_definition_id) {
-            self.module_function_copies
-                .detach_alias_dependent_visibility(visibility_id);
-            self.module_function_copies
-                .detach_ancestor_dependent_visibility(visibility_id);
-            self.push_existing_visibility_work(visibility_id, visibility_definition_ids);
-        }
-    }
-
-    fn push_existing_visibility_work(
-        &self,
-        visibility_definition_id: DefinitionId,
-        visibility_definition_ids: &mut Vec<DefinitionId>,
-    ) {
-        if self.definitions.contains_key(&visibility_definition_id)
-            && !visibility_definition_ids.contains(&visibility_definition_id)
-        {
-            visibility_definition_ids.push(visibility_definition_id);
-        }
-    }
-
-    fn remove_module_function_copy(&mut self, copy_definition_id: DefinitionId) -> Vec<DefinitionId> {
-        let Some(copy) = self.module_function_copies.remove(copy_definition_id) else {
-            return Vec::new();
-        };
-
-        self.detach_definition_from_declaration(copy.declaration_id, copy_definition_id);
-
-        if let Some(definition) = self.definitions.remove(&copy_definition_id) {
-            self.untrack_definition_strings(&definition);
-        }
-
-        copy.trigger_definition_ids
-    }
-
     fn detach_definition_from_declaration(&mut self, declaration_id: DeclarationId, definition_id: DefinitionId) {
+        self.detach_applied_method_visibility(definition_id);
+
         let Some((owner_id, unqualified_str_id)) = (|| {
             let declaration = self.declarations.get_mut(&declaration_id)?;
 
@@ -604,41 +297,107 @@ impl Graph {
         &self.definitions
     }
 
-    /// Returns the static program-order key used when Rubydex needs a deterministic source-order approximation.
+    /// Returns the static program-order key used when Rubydex needs a deterministic tie-breaker.
     ///
-    /// Ruby load order is not known from a set of indexed documents, so cross-file ordering uses URI lexical order.
-    /// Same-file ordering uses source offsets.
+    /// Ruby load order is not known from a set of indexed documents, so cross-file ordering uses URI lexical order only
+    /// for deterministic selection/presentation. Same-file ordering uses source offsets.
     pub(crate) fn definition_program_order_key(&self, definition_id: DefinitionId) -> Option<(&str, &Offset)> {
         let definition = self.definitions.get(&definition_id)?;
         let document = self.documents.get(definition.uri_id())?;
         Some((document.uri(), definition.offset()))
     }
 
-    pub(crate) fn compare_definitions_by_program_order(
-        &self,
-        left: DefinitionId,
-        right: DefinitionId,
-    ) -> Option<Ordering> {
-        let (left_uri, left_offset) = self.definition_program_order_key(left)?;
-        let (right_uri, right_offset) = self.definition_program_order_key(right)?;
+    pub(crate) fn definition_effect_order_key(&self, definition_id: DefinitionId) -> Option<(&str, &Offset)> {
+        if let Some(copy) = self.module_function_copies.get(definition_id) {
+            return copy
+                .trigger_definition_ids
+                .iter()
+                .filter_map(|trigger_definition_id| {
+                    let (trigger_uri, trigger_offset) = self.definition_program_order_key(*trigger_definition_id)?;
+                    Some((*trigger_definition_id, trigger_uri, trigger_offset))
+                })
+                .min_by(
+                    |(left_id, left_uri, left_offset), (right_id, right_uri, right_offset)| {
+                        DefinitionProgramOrderKey::new(*left_id, left_uri, left_offset)
+                            .cmp(&DefinitionProgramOrderKey::new(*right_id, right_uri, right_offset))
+                    },
+                )
+                .map(|(_, trigger_uri, trigger_offset)| (trigger_uri, trigger_offset))
+                .or_else(|| self.definition_program_order_key(definition_id));
+        }
 
-        Some(left_uri.cmp(right_uri).then_with(|| left_offset.cmp(right_offset)))
+        self.definition_program_order_key(definition_id)
     }
 
-    pub(crate) fn definition_precedes_position(
+    fn min_program_order_key<'a>(
+        current: Option<(DefinitionId, &'a str, &'a Offset)>,
+        candidate: (DefinitionId, &'a str, &'a Offset),
+    ) -> (DefinitionId, &'a str, &'a Offset) {
+        match current {
+            Some(current)
+                if DefinitionProgramOrderKey::new(current.0, current.1, current.2)
+                    .cmp(&DefinitionProgramOrderKey::new(candidate.0, candidate.1, candidate.2))
+                    .is_le() =>
+            {
+                current
+            }
+            _ => candidate,
+        }
+    }
+
+    pub(crate) fn definition_order_key_before_position(
         &self,
         definition_id: DefinitionId,
         uri_id: UriId,
         offset: &Offset,
-    ) -> Option<bool> {
-        let definition = self.definitions.get(&definition_id)?;
-        if *definition.uri_id() == uri_id {
-            return Some(definition.offset().start() < offset.start());
+    ) -> Option<(bool, &str, &Offset)> {
+        let position_uri = self.documents.get(&uri_id)?.uri();
+
+        if let Some(copy) = self.module_function_copies.get(definition_id) {
+            let mut same_file_key = None;
+            let mut cross_file_key = None;
+
+            for trigger_definition_id in &copy.trigger_definition_ids {
+                let Some((trigger_uri, trigger_offset)) = self.definition_program_order_key(*trigger_definition_id)
+                else {
+                    continue;
+                };
+
+                if trigger_uri == position_uri {
+                    if trigger_offset.start() < offset.start() {
+                        same_file_key = Some(Self::min_program_order_key(
+                            same_file_key,
+                            (*trigger_definition_id, trigger_uri, trigger_offset),
+                        ));
+                    }
+                } else {
+                    cross_file_key = Some(Self::min_program_order_key(
+                        cross_file_key,
+                        (*trigger_definition_id, trigger_uri, trigger_offset),
+                    ));
+                }
+            }
+
+            if let Some((_, uri, offset)) = same_file_key {
+                return Some((true, uri, offset));
+            }
+            if let Some((_, uri, offset)) = cross_file_key {
+                return Some((false, uri, offset));
+            }
+
+            return None;
         }
 
-        let (definition_uri, _) = self.definition_program_order_key(definition_id)?;
-        let visibility_uri = self.documents.get(&uri_id)?.uri();
-        Some(definition_uri < visibility_uri)
+        let (definition_uri, definition_offset) = self.definition_program_order_key(definition_id)?;
+        if definition_uri == position_uri {
+            if definition_offset.start() < offset.start() {
+                return Some((true, definition_uri, definition_offset));
+            }
+
+            return None;
+        }
+
+        Some((false, definition_uri, definition_offset))
     }
 
     /// Returns the ID of the unqualified name of a definition
@@ -1078,40 +837,42 @@ impl Graph {
                 Some(Visibility::Public)
             }
             Declaration::Method(_) => {
-                let mut latest_alias: Option<DefinitionId> = None;
-
-                for def_id in definitions.iter().rev() {
-                    let Some(definition) = self.definitions.get(def_id) else {
-                        continue;
-                    };
-
-                    match definition {
-                        Definition::MethodVisibility(vis) => {
-                            return Some(match vis.visibility() {
-                                Visibility::ModuleFunction => Visibility::Private,
-                                visibility => *visibility,
-                            });
-                        }
-                        Definition::Method(method) => return Some(*method.visibility()),
-                        Definition::AttrAccessor(attr) => return Some(*attr.visibility()),
-                        Definition::AttrReader(attr) => return Some(*attr.visibility()),
-                        Definition::AttrWriter(attr) => return Some(*attr.visibility()),
-                        Definition::MethodAlias(_) => {
-                            if latest_alias.is_none() {
-                                latest_alias = Some(*def_id);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-
-                if let Some(alias_def_id) = latest_alias
-                    && let Ok(target_id) = query::follow_method_alias(self, alias_def_id)
+                if !definitions
+                    .iter()
+                    .any(|definition_id| self.module_function_copies.get(*definition_id).is_some())
                 {
-                    return self.visibility(&target_id);
+                    return self.method_visibility_from_definitions(definitions.iter().rev().copied());
                 }
 
-                Some(Visibility::Public)
+                let mut ordered_definitions = definitions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, definition_id)| self.definitions.contains_key(definition_id))
+                    .map(|(index, definition_id)| (index, *definition_id))
+                    .collect::<Vec<_>>();
+
+                ordered_definitions.sort_unstable_by(|(left_index, left_id), (right_index, right_id)| {
+                    let left_generated = self.module_function_copies.get(*left_id).is_some();
+                    let right_generated = self.module_function_copies.get(*right_id).is_some();
+
+                    // Keep declaration order across different files here. URI order is only a deterministic resolver
+                    // approximation, not Ruby load order; using it for current visibility would let a cross-file
+                    // generated copy override already-known declaration order. Same-file generated copies still use
+                    // their trigger/effect offset so visibility calls before vs. after `module_function` behave correctly.
+                    if (left_generated || right_generated)
+                        && let (Some((left_uri, left_offset)), Some((right_uri, right_offset))) = (
+                            self.definition_effect_order_key(*left_id),
+                            self.definition_effect_order_key(*right_id),
+                        )
+                        && left_uri == right_uri
+                    {
+                        return left_offset.cmp(right_offset).then_with(|| left_index.cmp(right_index));
+                    }
+
+                    left_index.cmp(right_index)
+                });
+
+                self.method_visibility_from_definitions(ordered_definitions.into_iter().rev().map(|(_, def_id)| def_id))
             }
             Declaration::Namespace(Namespace::SingletonClass(_))
             | Declaration::GlobalVariable(_)
@@ -1120,9 +881,46 @@ impl Graph {
         }
     }
 
+    fn method_visibility_from_definitions(
+        &self,
+        definition_ids: impl IntoIterator<Item = DefinitionId>,
+    ) -> Option<Visibility> {
+        let mut latest_alias: Option<DefinitionId> = None;
+
+        for def_id in definition_ids {
+            let Some(definition) = self.definitions.get(&def_id) else {
+                continue;
+            };
+
+            if let Some(visibility) = definition.method_effective_visibility() {
+                return Some(visibility);
+            }
+
+            if matches!(definition, Definition::MethodAlias(_)) && latest_alias.is_none() {
+                latest_alias = Some(def_id);
+            }
+        }
+
+        if let Some(alias_def_id) = latest_alias
+            && let Ok(target_id) = query::follow_method_alias(self, alias_def_id)
+        {
+            return self.visibility(&target_id);
+        }
+
+        Some(Visibility::Public)
+    }
+
     /// Drains the accumulated work items, returning them for use by the resolver.
     pub fn take_pending_work(&mut self) -> Vec<Unit> {
         std::mem::take(&mut self.pending_work)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_method_visibility_indexes_consistent(&self) {
+        self.applied_method_visibilities
+            .assert_visibility_definitions_exist(&self.definitions);
+        self.unresolved_method_visibilities
+            .assert_visibility_definitions_exist(&self.definitions);
     }
 
     pub(crate) fn push_work(&mut self, unit: Unit) {
@@ -1216,7 +1014,7 @@ impl Graph {
         }
     }
 
-    fn untrack_definition_strings(&mut self, definition: &Definition) {
+    fn for_each_definition_string(definition: &Definition, mut f: impl FnMut(StringId)) {
         match definition {
             Definition::Class(_)
             | Definition::SingletonClass(_)
@@ -1224,70 +1022,50 @@ impl Graph {
             | Definition::Constant(_)
             | Definition::ConstantAlias(_)
             | Definition::ConstantVisibility(_) => {}
-            Definition::MethodVisibility(d) => self.untrack_string(*d.str_id()),
+            Definition::MethodVisibility(d) => f(*d.str_id()),
             Definition::Method(d) => {
-                self.untrack_string(*d.str_id());
+                f(*d.str_id());
                 for signature in d.signatures().as_slice() {
                     for parameter in signature {
-                        self.untrack_string(*parameter.inner().str());
+                        f(*parameter.inner().str());
                     }
                 }
             }
-            Definition::AttrAccessor(d) => self.untrack_string(*d.str_id()),
-            Definition::AttrReader(d) => self.untrack_string(*d.str_id()),
-            Definition::AttrWriter(d) => self.untrack_string(*d.str_id()),
-            Definition::GlobalVariable(d) => self.untrack_string(*d.str_id()),
-            Definition::InstanceVariable(d) => self.untrack_string(*d.str_id()),
-            Definition::ClassVariable(d) => self.untrack_string(*d.str_id()),
+            Definition::AttrAccessor(d) => f(*d.str_id()),
+            Definition::AttrReader(d) => f(*d.str_id()),
+            Definition::AttrWriter(d) => f(*d.str_id()),
+            Definition::GlobalVariable(d) => f(*d.str_id()),
+            Definition::InstanceVariable(d) => f(*d.str_id()),
+            Definition::ClassVariable(d) => f(*d.str_id()),
             Definition::MethodAlias(d) => {
-                self.untrack_string(*d.new_name_str_id());
-                self.untrack_string(*d.old_name_str_id());
+                f(*d.new_name_str_id());
+                f(*d.old_name_str_id());
             }
             Definition::GlobalVariableAlias(d) => {
-                self.untrack_string(*d.new_name_str_id());
-                self.untrack_string(*d.old_name_str_id());
+                f(*d.new_name_str_id());
+                f(*d.old_name_str_id());
             }
         }
+    }
+
+    fn untrack_definition_strings(&mut self, definition: &Definition) {
+        Self::for_each_definition_string(definition, |string_id| self.untrack_string(string_id));
     }
 
     fn track_definition_strings(&mut self, definition: &Definition) {
-        match definition {
-            Definition::Class(_)
-            | Definition::SingletonClass(_)
-            | Definition::Module(_)
-            | Definition::Constant(_)
-            | Definition::ConstantAlias(_)
-            | Definition::ConstantVisibility(_) => {}
-            Definition::MethodVisibility(d) => self.track_string(*d.str_id()),
-            Definition::Method(d) => {
-                self.track_string(*d.str_id());
-                for signature in d.signatures().as_slice() {
-                    for parameter in signature {
-                        self.track_string(*parameter.inner().str());
-                    }
-                }
-            }
-            Definition::AttrAccessor(d) => self.track_string(*d.str_id()),
-            Definition::AttrReader(d) => self.track_string(*d.str_id()),
-            Definition::AttrWriter(d) => self.track_string(*d.str_id()),
-            Definition::GlobalVariable(d) => self.track_string(*d.str_id()),
-            Definition::InstanceVariable(d) => self.track_string(*d.str_id()),
-            Definition::ClassVariable(d) => self.track_string(*d.str_id()),
-            Definition::MethodAlias(d) => {
-                self.track_string(*d.new_name_str_id());
-                self.track_string(*d.old_name_str_id());
-            }
-            Definition::GlobalVariableAlias(d) => {
-                self.track_string(*d.new_name_str_id());
-                self.track_string(*d.old_name_str_id());
-            }
-        }
+        // Local-graph definitions arrive with their strings already tracked by the
+        // indexer. Generated definitions are inserted directly into the graph, so
+        // their strings must have been interned or prepared before this point.
+        Self::for_each_definition_string(definition, |string_id| self.track_string(string_id));
     }
 
     fn track_string(&mut self, string_id: StringId) {
-        if let Some(string_ref) = self.strings.get_mut(&string_id) {
-            string_ref.increment_ref_count(1);
-        }
+        let Some(string_ref) = self.strings.get_mut(&string_id) else {
+            debug_assert!(false, "Cannot track a string that has not been interned or prepared");
+            return;
+        };
+
+        string_ref.increment_ref_count(1);
     }
 
     /// Decrements the ref count for a name and removes it if the count reaches zero.
@@ -1506,10 +1284,7 @@ impl Graph {
             for def_id in document.definitions() {
                 module_function_visibility_ids.extend(self.remove_module_function_copies_for_source(*def_id));
                 module_function_visibility_ids.extend(self.remove_module_function_copies_for_alias(*def_id));
-                module_function_visibility_ids.extend(self.remove_module_function_copy_for_visibility(*def_id));
-                if let Some(owner_id) = self.remove_unresolved_method_visibility(*def_id) {
-                    self.remove_unresolved_method_visibility_diagnostic(owner_id, *def_id);
-                }
+                module_function_visibility_ids.extend(self.remove_method_visibility_side_effects(*def_id));
 
                 if let Some(declaration_id) = self.definition_id_to_declaration_id(*def_id).copied() {
                     pending_detachments.entry(declaration_id).or_default().push(*def_id);
@@ -1599,6 +1374,10 @@ impl Graph {
             .collect();
 
         if !missed_def_ids.is_empty() {
+            for def_id in &missed_def_ids {
+                self.detach_applied_method_visibility(*def_id);
+            }
+
             for declaration in self.declarations.values_mut() {
                 for def_id in &missed_def_ids {
                     declaration.remove_definition(def_id);
@@ -1672,6 +1451,7 @@ impl Graph {
     ) {
         // Collect names before detaching — after detachment, definitions() may be empty
         let seed_names = self.names_for_declaration(decl_id);
+        let method_member_changes = self.method_member_changes_for_detach(decl_id, detach_def_ids);
 
         // Detach pending definitions before deciding the mode
         if let Some(decl) = self.declarations.get_mut(&decl_id) {
@@ -1680,6 +1460,16 @@ impl Graph {
             }
             if !detach_def_ids.is_empty() {
                 decl.clear_diagnostics();
+            }
+        }
+
+        if !detach_def_ids.is_empty() && method_member_changes.is_empty() {
+            self.requeue_method_visibility_definitions_for_declaration(decl_id);
+        }
+
+        if !detach_def_ids.is_empty() {
+            for (owner_id, member_str_id) in method_member_changes {
+                self.requeue_method_visibility_dependents_for_member_change(owner_id, member_str_id);
             }
         }
 
@@ -1774,12 +1564,46 @@ impl Graph {
 
             self.push_work(Unit::Ancestors(decl_id));
             self.requeue_unresolved_method_visibilities_for_owner(decl_id);
+            self.requeue_method_visibility_definitions_for_owner(decl_id);
             self.requeue_module_function_copies_for_owner(decl_id);
 
             for seed_name_id in seed_names {
                 self.queue_ancestor_triggered_invalidation(seed_name_id, queue);
             }
         }
+    }
+
+    fn method_member_changes_for_detach(
+        &self,
+        declaration_id: DeclarationId,
+        detach_def_ids: &[DefinitionId],
+    ) -> Vec<(DeclarationId, StringId)> {
+        let Some(declaration) = self.declarations.get(&declaration_id) else {
+            return Vec::new();
+        };
+        if !matches!(declaration, Declaration::Method(_)) {
+            return Vec::new();
+        }
+
+        let owner_id = *declaration.owner_id();
+        let mut member_changes = Vec::new();
+        let mut seen_str_ids = IdentityHashSet::default();
+
+        for definition_id in detach_def_ids {
+            let Some(definition) = self.definitions.get(definition_id) else {
+                continue;
+            };
+            if !definition.establishes_method_member() {
+                continue;
+            }
+
+            let str_id = self.definition_string_id(definition);
+            if seen_str_ids.insert(str_id) {
+                member_changes.push((owner_id, str_id));
+            }
+        }
+
+        member_changes
     }
 
     /// The name's structural dependency is broken (its nesting or parent scope was removed).
@@ -1799,6 +1623,7 @@ impl Graph {
                     }
                     NameDependent::Definition(def_id) => {
                         self.push_work(Unit::Definition(*def_id));
+                        self.detach_applied_method_visibility(*def_id);
 
                         if let Some(decl) = self.declarations.get_mut(&old_decl_id) {
                             decl.remove_definition(def_id);
@@ -2301,8 +2126,11 @@ mod tests {
         let strings = context.graph().strings();
         assert_eq!(strings.get(&StringId::from("method_name()")).unwrap().ref_count(), 1);
         assert_eq!(strings.get(&StringId::from("accessor_name()")).unwrap().ref_count(), 1);
+        assert_eq!(strings.get(&StringId::from("accessor_name=()")).unwrap().ref_count(), 1);
         assert_eq!(strings.get(&StringId::from("reader_name()")).unwrap().ref_count(), 1);
-        assert_eq!(strings.get(&StringId::from("writer_name()")).unwrap().ref_count(), 1);
+        assert!(strings.get(&StringId::from("reader_name=()")).is_none());
+        assert_eq!(strings.get(&StringId::from("writer_name=()")).unwrap().ref_count(), 1);
+        assert!(strings.get(&StringId::from("writer_name()")).is_none());
         assert_eq!(strings.get(&StringId::from("$global_var")).unwrap().ref_count(), 1);
         assert_eq!(strings.get(&StringId::from("@@class_var")).unwrap().ref_count(), 1);
         assert_eq!(strings.get(&StringId::from("@instance_var")).unwrap().ref_count(), 1);
@@ -2819,14 +2647,14 @@ mod tests {
         assert_eq!(2, context.graph().method_references.len());
         assert_eq!(2, context.graph().documents.len());
         assert_eq!(20, context.graph().names.len());
-        assert_eq!(53, context.graph().strings.len());
+        assert_eq!(49, context.graph().strings.len());
         context.index_uri("file:///foo.rb", source);
         assert_eq!(51, context.graph().definitions.len());
         assert_eq!(13, context.graph().constant_references.len());
         assert_eq!(2, context.graph().method_references.len());
         assert_eq!(2, context.graph().documents.len());
         assert_eq!(20, context.graph().names.len());
-        assert_eq!(53, context.graph().strings.len());
+        assert_eq!(49, context.graph().strings.len());
     }
 
     #[test]

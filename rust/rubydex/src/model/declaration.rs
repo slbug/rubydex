@@ -425,7 +425,6 @@ impl Declaration {
             if let Some(pos) = it.definition_ids.iter().position(|id| id == definition_id) {
                 // Definition order is semantic for retroactive visibility; keep it stable.
                 it.definition_ids.remove(pos);
-                it.definition_ids.shrink_to_fit();
                 true
             } else {
                 false

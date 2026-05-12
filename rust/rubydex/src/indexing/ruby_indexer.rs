@@ -1230,6 +1230,11 @@ impl<'a> RubyIndexer<'a> {
     }
 
     fn handle_constant_visibility(&mut self, node: &ruby_prism::CallNode, visibility: Visibility) {
+        if self.current_nesting_is_runtime_body() {
+            self.visit_runtime_call_node(node);
+            return;
+        }
+
         let receiver = node.receiver();
 
         let receiver_name_id = match receiver {
@@ -1237,10 +1242,6 @@ impl<'a> RubyIndexer<'a> {
                 self.index_constant_reference(&receiver.unwrap(), true)
             }
             Some(ruby_prism::Node::SelfNode { .. }) | None => match self.nesting_stack.last() {
-                Some(Nesting::Method(_)) => {
-                    self.visit_call_node_parts(node);
-                    return;
-                }
                 None => {
                     self.local_graph.add_diagnostic(
                         Rule::InvalidPrivateConstant,
@@ -1319,13 +1320,14 @@ impl<'a> RubyIndexer<'a> {
         visibility: Visibility,
         call_name: &str,
     ) {
+        if self.current_nesting_is_runtime_body() {
+            self.visit_runtime_call_node(node);
+            return;
+        }
+
         match node.receiver() {
-            Some(ruby_prism::Node::SelfNode { .. }) | None => match self.nesting_stack.last() {
-                Some(Nesting::Method(_)) => {
-                    self.visit_call_node_parts(node);
-                    return;
-                }
-                None => {
+            Some(ruby_prism::Node::SelfNode { .. }) | None => {
+                if self.nesting_stack.last().is_none() {
                     self.local_graph.add_diagnostic(
                         Rule::InvalidMethodVisibility,
                         Offset::from_prism_location(&node.location()),
@@ -1334,8 +1336,7 @@ impl<'a> RubyIndexer<'a> {
                     self.visit_call_node_parts(node);
                     return;
                 }
-                _ => {}
-            },
+            }
             _ => {
                 self.visit_call_node_parts(node);
                 return;
@@ -2003,8 +2004,6 @@ impl Visit<'_> for RubyIndexer<'_> {
                 .unwrap_or_else(|| offset_for_comments.start());
 
             Self::each_string_or_symbol_arg(call, |name, location| {
-                let reader_str_id = self.local_graph.intern_string(format!("{name}()"));
-                let writer_str_id = self.local_graph.intern_string(format!("{name}=()"));
                 let parent_nesting_id = self.parent_nesting_id();
                 let offset = Offset::from_prism_location(&location);
 
@@ -2018,6 +2017,9 @@ impl Visit<'_> for RubyIndexer<'_> {
 
                 match kind {
                     AttrKind::Accessor => {
+                        let reader_str_id = self.local_graph.intern_string(format!("{name}()"));
+                        let writer_str_id = self.local_graph.intern_string(format!("{name}=()"));
+
                         let reader = Definition::AttrAccessor(Box::new(AttrAccessorDefinition::new(
                             reader_str_id,
                             self.uri_id,
@@ -2043,6 +2045,8 @@ impl Visit<'_> for RubyIndexer<'_> {
                         self.add_member_to_current_owner(writer_id);
                     }
                     AttrKind::Reader => {
+                        let reader_str_id = self.local_graph.intern_string(format!("{name}()"));
+
                         let definition = Definition::AttrReader(Box::new(AttrReaderDefinition::new(
                             reader_str_id,
                             self.uri_id,
@@ -2056,6 +2060,8 @@ impl Visit<'_> for RubyIndexer<'_> {
                         self.add_member_to_current_owner(definition_id);
                     }
                     AttrKind::Writer => {
+                        let writer_str_id = self.local_graph.intern_string(format!("{name}=()"));
+
                         let definition = Definition::AttrWriter(Box::new(AttrWriterDefinition::new(
                             writer_str_id,
                             self.uri_id,
@@ -2199,7 +2205,7 @@ impl Visit<'_> for RubyIndexer<'_> {
             "private" | "protected" | "public" | "module_function" => {
                 let visibility = Visibility::from_string(message.as_str());
 
-                if visibility == Visibility::ModuleFunction && self.current_nesting_is_runtime_body() {
+                if self.current_nesting_is_runtime_body() {
                     self.visit_runtime_call_node(node);
                     return;
                 }

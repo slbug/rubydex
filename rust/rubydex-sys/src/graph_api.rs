@@ -1001,11 +1001,16 @@ pub unsafe extern "C" fn rdx_graph_visibility(pointer: GraphPointer, declaration
             return ptr::null();
         };
 
+        debug_assert_ne!(
+            visibility,
+            Visibility::ModuleFunction,
+            "module_function visibility must be resolved before C API use"
+        );
+
         let c_visibility = match visibility {
             Visibility::Public => CVisibility::Public,
             Visibility::Protected => CVisibility::Protected,
-            Visibility::Private => CVisibility::Private,
-            Visibility::ModuleFunction => unreachable!("module_function visibility must be resolved before C API use"),
+            Visibility::Private | Visibility::ModuleFunction => CVisibility::Private,
         };
 
         Box::into_raw(Box::new(c_visibility)).cast_const()
